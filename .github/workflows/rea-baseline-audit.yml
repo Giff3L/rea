@@ -1,0 +1,155 @@
+name: REA isolated baseline
+
+# Fork-only baseline. No main/schedule/Jarvis triggers; not a full security audit.
+on:
+  push:
+    branches: [rea-security-baseline-20261014]
+    paths: [.github/workflows/rea-baseline-audit.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rea-isolated-baseline
+  cancel-in-progress: false
+
+jobs:
+  linux-baseline:
+    if: github.repository == 'Giff3L/rea' && github.ref == 'refs/heads/rea-security-baseline-20261014'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      HUSKY: "0"
+      TURBO_TELEMETRY_DISABLED: "1"
+      TESTED_SOURCE_SHA: 6060de329de9f3636f63e24a2419847fd9d3f889
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the fixed review source without persisted Git credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 6060de329de9f3636f63e24a2419847fd9d3f889
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 1
+
+      - name: Use the repository's fixed Node version
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+
+      - name: Record source identity
+        run: |
+          mkdir -p "$RUNNER_TEMP/rea-baseline-audit"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$TESTED_SOURCE_SHA"
+          git rev-parse HEAD > "$RUNNER_TEMP/rea-baseline-audit/source-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/rea-baseline-audit/source-tree.txt"
+          node --version > "$RUNNER_TEMP/rea-baseline-audit/node-version.txt"
+
+      - name: Use the package's fixed npm version
+        timeout-minutes: 3
+        run: npm install --global npm@11.16.0 --ignore-scripts --no-audit --no-fund
+
+      - name: Record npm version
+        run: |
+          npm --version > "$RUNNER_TEMP/rea-baseline-audit/npm-version.txt"
+          test "$(npm --version)" = "11.16.0"
+
+      - name: Install locked dependencies without lifecycle scripts
+        id: install
+        timeout-minutes: 5
+        run: |
+          set +e
+          npm ci --ignore-scripts --no-audit --no-fund 2>&1 | tee "$RUNNER_TEMP/rea-baseline-audit/install.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "$RUNNER_TEMP/rea-baseline-audit/install.exit"
+          exit "$result"
+
+      - name: Check the locked dependency graph for published advisories
+        id: audit
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          set +e
+          npm audit --json > "$RUNNER_TEMP/rea-baseline-audit/npm-audit.json" 2> "$RUNNER_TEMP/rea-baseline-audit/npm-audit.stderr"
+          result=$?
+          printf '%s\n' "$result" > "$RUNNER_TEMP/rea-baseline-audit/npm-audit.exit"
+          exit "$result"
+
+      - name: Run existing source tests
+        id: source
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 12
+        run: |
+          set +e
+          npm run test:fast 2>&1 | tee "$RUNNER_TEMP/rea-baseline-audit/source-tests.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "$RUNNER_TEMP/rea-baseline-audit/source-tests.exit"
+          exit "$result"
+
+      - name: Run existing Python producer tests
+        id: python
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 3
+        run: |
+          set +e
+          npm run test:python 2>&1 | tee "$RUNNER_TEMP/rea-baseline-audit/python-tests.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "$RUNNER_TEMP/rea-baseline-audit/python-tests.exit"
+          exit "$result"
+
+      - name: Build the fixed source
+        id: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 8
+        run: |
+          set +e
+          npm run build:cached 2>&1 | tee "$RUNNER_TEMP/rea-baseline-audit/build.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "$RUNNER_TEMP/rea-baseline-audit/build.exit"
+          exit "$result"
+
+      - name: Smoke-test the built CLI without a target or agent registration
+        id: cli
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 1
+        run: |
+          set +e
+          node scripts/rea.mjs --version 2>&1 | tee "$RUNNER_TEMP/rea-baseline-audit/cli-version.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "$RUNNER_TEMP/rea-baseline-audit/cli-version.exit"
+          exit "$result"
+
+      - name: Explain coverage and publish step outcomes
+        if: ${{ always() }}
+        run: |
+          cat <<'SCOPE' >> "$GITHUB_STEP_SUMMARY"
+          ## REA baseline scope
+          Tested source: 6060de329de9f3636f63e24a2419847fd9d3f889.
+          Fresh GitHub-hosted Ubuntu runner; read-only repository token and no persisted checkout credentials.
+          No repository/environment secrets, cloud credentials, personal data, or Jarvis integration are supplied.
+          This runner is not a network containment boundary. Repository tests and the build execute code.
+          Dependency lifecycle scripts are disabled, so this does not verify the Frida installer or a normal npm installation.
+          Source tests, Python producer tests, build and CLI startup do not establish real-provider, Windows, network-isolation, or end-to-end agent security.
+          Advisory service errors are failures, not evidence that dependencies are clean.
+          | Step | Outcome |
+          | --- | --- |
+          | Install | ${{ steps.install.outcome }} |
+          | Dependency advisories | ${{ steps.audit.outcome }} |
+          | Source tests | ${{ steps.source.outcome }} |
+          | Python tests | ${{ steps.python.outcome }} |
+          | Build | ${{ steps.build.outcome }} |
+          | CLI startup | ${{ steps.cli.outcome }} |
+          SCOPE
+
+      - name: Retain baseline logs and actual exit codes
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rea-baseline-${{ github.run_id }}
+          path: ${{ runner.temp }}/rea-baseline-audit/
+          if-no-files-found: warn
+          retention-days: 7
