@@ -1,0 +1,138 @@
+name: REA Frida permission diagnostic
+'on':
+  push:
+    branches:
+    - rea-security-baseline-20261014
+    paths:
+    - .github/workflows/rea-frida-diagnostic.yml
+permissions:
+  contents: read
+jobs:
+  frida-permissions:
+    if: github.repository == 'Giff3L/rea' && github.ref == 'refs/heads/rea-security-baseline-20261014'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: 24.18.0
+    - name: Use pinned npm
+      run: npm install --global npm@11.16.0 --ignore-scripts --no-audit --no-fund
+    - name: Prepare a separate non-root identity and synthetic consenting C fixture
+      run: |
+        set -euo pipefail
+        sudo useradd --create-home --shell /bin/bash rea-frida
+        sudo chmod 700 /home/rea-frida
+        mkdir -p "$RUNNER_TEMP/rea-frida-input"
+        cat <<'FIXTURE_EOF' > "$RUNNER_TEMP/rea-frida-input/fixture.c"
+        #include <stdio.h>
+        #include <unistd.h>
+        #include <string.h>
+        #include <sys/prctl.h>
+        int main(int argc, char **argv) {
+          if (argc > 1 && strcmp(argv[1], "--consent") == 0) {
+            if (prctl(PR_SET_PTRACER, getppid(), 0, 0, 0) != 0) {perror("PR_SET_PTRACER"); return 2;}
+          }
+          puts("READY"); fflush(stdout);
+          while (1) sleep(1);
+        }
+        FIXTURE_EOF
+        cat <<'PROBE_EOF' > "$RUNNER_TEMP/rea-frida-input/probe.mjs"
+        import {spawn} from 'node:child_process';
+        import {once} from 'node:events';
+        import {readFile} from 'node:fs/promises';
+        import * as frida from 'frida';
+        const mode=process.argv[2];
+        const phase=name=>console.log(JSON.stringify({mode,phase:name,at:new Date().toISOString()}));
+        const device=await frida.getLocalDevice(); phase('device_acquired');
+        let child,pid,session,script;
+        const deadline=setTimeout(()=>{
+          console.error(JSON.stringify({mode,ok:false,error:'fixture deadline'}));
+          if(child) child.kill('SIGKILL');
+          if(pid) {try{process.kill(pid,'SIGKILL')}catch{}}
+          process.exit(1);
+        },20000);
+        try {
+          if(mode==='spawn') {
+            pid=await device.spawn('/home/rea-frida/fixture',{argv:['/home/rea-frida/fixture','--consent']});
+            phase('spawned_paused');
+          } else {
+            child=spawn('/home/rea-frida/fixture',mode==='consent'?['--consent']:[],{stdio:['ignore','pipe','inherit'],env:{PATH:process.env.PATH}});
+            pid=child.pid;
+            await new Promise((resolve,reject)=>{
+              child.once('error',reject); child.once('exit',code=>reject(new Error('fixture exited '+code)));
+              let text='';child.stdout.on('data',data=>{text+=data.toString();if(text.includes('READY'))resolve();});
+            });
+            phase('ready');
+          }
+          session=await device.attach(pid);phase('attached');
+          script=await session.createScript('send({audit:"synthetic-only",pid:Process.id});');
+          const observed=new Promise((resolve,reject)=>script.message.connect(message=>{
+            if(message.type==='send')resolve(message.payload);else if(message.type==='error')reject(new Error(message.description));
+          }));
+          await script.load();phase('script_loaded');
+          if(mode==='spawn') {await device.resume(pid);phase('resumed');}
+          const value=await observed;
+          if(value.audit!=='synthetic-only'||value.pid!==pid)throw new Error('wrong fixture');
+          await script.unload();script=undefined;await session.detach();session=undefined;
+          process.kill(pid,0);
+          console.log(JSON.stringify({mode,ok:true,instrumented:true,detached_target_alive:true}));
+        } finally {
+          if(script)await script.unload().catch(()=>{});
+          if(session)await session.detach().catch(()=>{});
+          if(child){const exited=once(child,'exit');child.kill('SIGKILL');await exited;}
+          else if(pid){await device.kill(pid).catch(()=>{try{process.kill(pid,'SIGKILL')}catch{}});}
+          clearTimeout(deadline);
+        }
+        PROBE_EOF
+        sudo install -o rea-frida -g rea-frida -m 600 "$RUNNER_TEMP/rea-frida-input/"{fixture.c,probe.mjs} /home/rea-frida/
+        printf 'AUDIT_NODE_BIN=%s\n' "$(dirname "$(command -v node)")" >> "$GITHUB_ENV"
+        cat <<'RUN_EOF' > "$RUNNER_TEMP/rea-frida-input/run.sh"
+        set -euo pipefail
+        cd /home/rea-frida
+        test "$(id -u)" -ne 0
+        if sudo -n true 2>/dev/null; then exit 1; fi
+        mkdir evidence
+        id > evidence/identity.txt
+        cat /proc/sys/kernel/yama/ptrace_scope > evidence/ptrace-scope.txt
+        gcc -O2 -Wall -Wextra -o fixture fixture.c
+        printf '%s\n' '{"private":true,"type":"module","dependencies":{"frida":"17.23.2"}}' > package.json
+        npm install --no-audit --no-fund --foreground-scripts > evidence/install.log 2>&1
+        cp package-lock.json evidence/
+        set +e
+        failed=0
+        for mode in plain consent spawn; do
+          node probe.mjs "$mode" 2>&1 | tee "evidence/$mode.log"
+          result=${PIPESTATUS[0]}
+          printf '%s\n' "$result" > "evidence/$mode.exit"
+          if [ "$result" -ne 0 ]; then failed=1; fi
+        done
+        exit "$failed"
+        RUN_EOF
+        sudo install -o root -g root -m 755 "$RUNNER_TEMP/rea-frida-input/run.sh" /home/rea-frida/run.sh
+    - name: Compare plain attach, target-local consent, and Frida-owned spawn
+      id: probe
+      timeout-minutes: 4
+      run: sudo -u rea-frida env -i HOME=/home/rea-frida PATH="$AUDIT_NODE_BIN:/usr/local/bin:/usr/bin:/bin" CI=1 bash /home/rea-frida/run.sh
+    - name: Collect all three outcomes even when a mode fails
+      if: ${{ always() }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/rea-frida-evidence"
+        if sudo test -d /home/rea-frida/evidence; then
+         sudo cp -a /home/rea-frida/evidence/. "$RUNNER_TEMP/rea-frida-evidence/"
+         sudo chown -R "$(id -un):$(id -gn)" "$RUNNER_TEMP/rea-frida-evidence"
+        fi
+        printf '%s\n' 'Synthetic C fixture and Frida 17.23.2 only. Non-root user, clean environment. Kernel ptrace_scope is recorded and never changed. Consent is set only by the disposable target for its parent and descendants. A failed mode keeps the job red; inspect each recorded exit/log independently. No REA production code is patched or external target instrumented.' >> "$GITHUB_STEP_SUMMARY"
+    - name: Retain diagnostic evidence
+      if: ${{ always() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rea-frida-diagnostic-${{ github.run_id }}
+        path: ${{ runner.temp }}/rea-frida-evidence/
+        if-no-files-found: warn
+        retention-days: 7
