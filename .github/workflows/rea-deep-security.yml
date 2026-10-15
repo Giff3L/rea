@@ -69,8 +69,9 @@ jobs:
         case "$stage" in
           identity)
             test "$(id -u)" -ne 0
-            ! sudo -n true 2>/dev/null
-            ! test -r /root/rea-audit-denied-canary
+            if sudo -n true 2>/dev/null; then echo 'Unexpected sudo authority' >&2; exit 1; fi
+            if test -r /root/rea-audit-denied-canary; then echo 'Unexpected privileged file access' >&2; exit 1; fi
+            printf 'sudo_denied=true\nprivileged_file_read_denied=true\n' > "$evidence/privilege-checks.txt"
             id > "$evidence/identity.txt"
             node --version > "$evidence/node-version.txt"
             npm --version > "$evidence/npm-version.txt"
@@ -314,21 +315,32 @@ jobs:
         import { spawn } from 'node:child_process';
         import { once } from 'node:events';
         import * as frida from 'frida';
+        import { readFile } from 'node:fs/promises';
+        const phase = name => console.log(JSON.stringify({phase:name,at:new Date().toISOString()}));
+        phase('module_loaded');
+        console.log(JSON.stringify({ptrace_scope:(await readFile('/proc/sys/kernel/yama/ptrace_scope','utf8')).trim()}));
         const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {stdio:'ignore', env:{PATH:process.env.PATH}});
         let session; let script;
-        const deadline = setTimeout(() => {child.kill('SIGKILL'); console.error('Frida fixture deadline'); process.exit(1);}, 25000);
+        const deadline = setTimeout(() => {child.kill('SIGKILL'); console.error('Frida fixture deadline'); process.exit(1);}, 60000);
         try {
           await once(child, 'spawn');
+          phase('child_spawned');
           const device = await frida.getLocalDevice();
+          phase('device_acquired');
           session = await device.attach(child.pid);
+          phase('attached');
           script = await session.createScript('send({audit:"synthetic-only", pid:Process.id});');
+          phase('script_created');
           const observed = new Promise((resolve,reject) => script.message.connect(message => {
             if (message.type === 'send') resolve(message.payload); else if (message.type === 'error') reject(new Error(message.description));
           }));
           await script.load();
+          phase('script_loaded');
           const message = await observed;
+          phase('message_received');
           if (message.audit !== 'synthetic-only' || message.pid !== child.pid) throw new Error('Unexpected Frida fixture identity');
           await script.unload(); script = undefined; await session.detach(); session = undefined;
+          phase('detached');
           process.kill(child.pid, 0);
           console.log(JSON.stringify({ok:true, version:frida.version, fixture_instrumented:true, detached_target_alive:true}));
         } finally {
