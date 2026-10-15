@@ -36,6 +36,7 @@ jobs:
     - name: Use pinned npm
       run: npm install --global npm@11.16.0 --ignore-scripts --no-audit --no-fund
     - name: Create an unprivileged test user with clean source and synthetic probes
+      timeout-minutes: 5
       run: |
         set -euo pipefail
         test "$(git rev-parse HEAD)" = 6060de329de9f3636f63e24a2419847fd9d3f889
@@ -52,6 +53,7 @@ jobs:
         cat <<'AUDIT_RUNNER_EOF' > "$RUNNER_TEMP/rea-deep-input/run.sh"
         #!/usr/bin/env bash
         set -euo pipefail
+        trap 'printf "Audit harness failed at line %s\n" "$LINENO" >&2' ERR
         cd /home/rea-review/work
         stage="$1"
         evidence=/home/rea-review/evidence
@@ -76,6 +78,12 @@ jobs:
             test "$(npm --version)" = 11.16.0
             git init -q
             git add .
+            # Preserve the five pinned gitlinks without fetching or running submodules.
+            git update-index --add --cacheinfo 160000,4fdab3d464d97b68e0af9088df3f9e2e1545b21c,third_party/binwalk
+            git update-index --add --cacheinfo 160000,effeb734fc570c32650f88b159608979dc7b423e,third_party/ghidra-nativeaot
+            git update-index --add --cacheinfo 160000,5844800a486d2248fa949b74c9896285f5b54de2,third_party/jadx-headless-mcp
+            git update-index --add --cacheinfo 160000,1fcc7a0a584a70a96c31f5a276c20944d199a089,third_party/unblob
+            git update-index --add --cacheinfo 160000,8219bf5016a063d7fb215101a8c45d5959ec733f,third_party/wakaru
             test "$(git write-tree)" = 1a0962b0bd2bddc5046c43a0d2be04eb0e8f2acb
             git -c user.name=REA-Audit -c user.email=audit@example.invalid commit -qm 'Fixed source fixture' --no-verify
             printf '%s\n' 6060de329de9f3636f63e24a2419847fd9d3f889 > "$evidence/source-commit.txt"
