@@ -1,0 +1,297 @@
+# Fixed-source audit fixtures only; no real targets, agent registration, secrets, or Jarvis integration.
+# Lifecycle scripts remain disabled; these checks do not certify complete containment or third-party engines.
+name: REA platform and security boundaries
+'on':
+  push:
+    branches:
+    - rea-security-baseline-20261014
+    paths:
+    - .github/workflows/rea-platform-boundaries.yml
+  workflow_dispatch: null
+permissions:
+  contents: read
+concurrency:
+  group: rea-platform-boundaries
+  cancel-in-progress: false
+jobs:
+  linux-boundaries:
+    if: github.repository == 'Giff3L/rea' && github.ref == 'refs/heads/rea-security-baseline-20261014'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      HUSKY: '0'
+      TURBO_TELEMETRY_DISABLED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Check out fixed review source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        ref: 6060de329de9f3636f63e24a2419847fd9d3f889
+        persist-credentials: false
+        submodules: false
+        fetch-depth: 1
+    - name: Use fixed Node version
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version-file: .nvmrc
+    - name: Record source and host
+      run: |
+        mkdir -p "$RUNNER_TEMP/rea-platform-audit"
+        test "$(git rev-parse HEAD)" = "6060de329de9f3636f63e24a2419847fd9d3f889"
+        git rev-parse HEAD > "$RUNNER_TEMP/rea-platform-audit/source-commit.txt"
+        node -p 'JSON.stringify({platform:process.platform,architecture:process.arch,node:process.version})' > "$RUNNER_TEMP/rea-platform-audit/host.json"
+    - name: Use fixed npm version
+      timeout-minutes: 3
+      run: |
+        npm install --global npm@11.16.0 --ignore-scripts --no-audit --no-fund
+        test "$(npm --version)" = "11.16.0"
+    - name: Install locked graph without lifecycle scripts
+      id: install
+      timeout-minutes: 5
+      run: |
+        set +e
+        {
+          npm ci --ignore-scripts --no-audit --no-fund
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/install.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/install.exit"
+        exit "$result"
+    - name: Exercise selected filesystem, browser and MCP boundaries
+      id: boundaries
+      timeout-minutes: 18
+      run: |
+        set +e
+        {
+          npm run test:focused -- tests/boundary/browser/cdpEndpointResponseBounds.test.ts tests/boundary/browser/webSourceMapFetcher.test.ts tests/boundary/browser/webSourceMapResponseCleanup.test.ts tests/boundary/providers/native/artifactProvider.archiveSafety.test.ts tests/boundary/filesystem/safeOutputTree.test.ts tests/boundary/filesystem/clientConfigurationEnvironment.test.ts tests/boundary/mcp/toolSchemaValidity.test.ts tests/acceptance/applications/runtime.test.ts
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/boundaries.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/boundaries.exit"
+        exit "$result"
+      if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+    - name: Retain actual logs and exit codes
+      if: ${{ always() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rea-platform-linux-${{ github.run_id }}
+        path: ${{ runner.temp }}/rea-platform-audit/
+        if-no-files-found: warn
+        retention-days: 7
+  windows-native-build:
+    if: github.repository == 'Giff3L/rea' && github.ref == 'refs/heads/rea-security-baseline-20261014'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HUSKY: '0'
+      TURBO_TELEMETRY_DISABLED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Check out fixed review source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        ref: 6060de329de9f3636f63e24a2419847fd9d3f889
+        persist-credentials: false
+        submodules: false
+        fetch-depth: 1
+    - name: Use fixed Node version
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version-file: .nvmrc
+    - name: Record source and host
+      run: |
+        mkdir -p "$RUNNER_TEMP/rea-platform-audit"
+        test "$(git rev-parse HEAD)" = "6060de329de9f3636f63e24a2419847fd9d3f889"
+        git rev-parse HEAD > "$RUNNER_TEMP/rea-platform-audit/source-commit.txt"
+        node -p 'JSON.stringify({platform:process.platform,architecture:process.arch,node:process.version})' > "$RUNNER_TEMP/rea-platform-audit/host.json"
+    - name: Install cross compiler on disposable runner
+      id: compiler
+      timeout-minutes: 6
+      run: |
+        set +e
+        {
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y g++-mingw-w64-x86-64
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/compiler.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/compiler.exit"
+        exit "$result"
+    - name: Build and verify exact-source Windows native controls
+      id: native
+      timeout-minutes: 4
+      run: |
+        set +e
+        {
+          node scripts/build-windows-native.mjs && node scripts/verify-windows-native-artifact.mjs
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/native.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/native.exit"
+        exit "$result"
+    - name: Build independent process-boundary fixture
+      id: fixture
+      timeout-minutes: 2
+      run: |
+        set +e
+        {
+          mkdir -p .cache/windows-process-boundary && x86_64-w64-mingw32-g++ -municode -std=c++17 -O2 -static -Wall -Wextra -o .cache/windows-process-boundary/process-boundary.exe tests/fixtures/windows/processBoundary.cc -ladvapi32
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/fixture.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/fixture.exit"
+        exit "$result"
+    - name: Transfer verified native controls within this run
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rea-audit-windows-native
+        path: native/windows/build/
+        if-no-files-found: error
+        retention-days: 1
+    - name: Transfer independent fixture within this run
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rea-audit-process-fixture
+        path: .cache/windows-process-boundary/
+        if-no-files-found: error
+        retention-days: 1
+    - name: Retain actual logs and exit codes
+      if: ${{ always() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rea-platform-native-build-${{ github.run_id }}
+        path: ${{ runner.temp }}/rea-platform-audit/
+        if-no-files-found: warn
+        retention-days: 7
+  windows-boundaries:
+    if: github.repository == 'Giff3L/rea' && github.ref == 'refs/heads/rea-security-baseline-20261014'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      HUSKY: '0'
+      TURBO_TELEMETRY_DISABLED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Check out fixed review source
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        ref: 6060de329de9f3636f63e24a2419847fd9d3f889
+        persist-credentials: false
+        submodules: false
+        fetch-depth: 1
+    - name: Use fixed Node version
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version-file: .nvmrc
+    - name: Record source and host
+      run: |
+        mkdir -p "$RUNNER_TEMP/rea-platform-audit"
+        test "$(git rev-parse HEAD)" = "6060de329de9f3636f63e24a2419847fd9d3f889"
+        git rev-parse HEAD > "$RUNNER_TEMP/rea-platform-audit/source-commit.txt"
+        node -p 'JSON.stringify({platform:process.platform,architecture:process.arch,node:process.version})' > "$RUNNER_TEMP/rea-platform-audit/host.json"
+    - name: Use fixed npm version
+      timeout-minutes: 3
+      run: |
+        npm install --global npm@11.16.0 --ignore-scripts --no-audit --no-fund
+        test "$(npm --version)" = "11.16.0"
+    - name: Install locked graph without lifecycle scripts
+      id: install
+      timeout-minutes: 5
+      run: |
+        set +e
+        {
+          npm ci --ignore-scripts --no-audit --no-fund
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/install.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/install.exit"
+        exit "$result"
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: rea-audit-windows-native
+        path: native/windows/build/
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: rea-audit-process-fixture
+        path: .cache/windows-process-boundary/
+    - name: Verify native artifact before loading it
+      id: native
+      timeout-minutes: 1
+      run: |
+        set +e
+        {
+          node scripts/verify-windows-native-artifact.mjs
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/native.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/native.exit"
+        exit "$result"
+      if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+    - name: Build fixed source on Windows
+      id: build
+      timeout-minutes: 8
+      run: |
+        set +e
+        {
+          npm run build:cached
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/build.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/build.exit"
+        exit "$result"
+      if: ${{ !cancelled() && steps.native.outcome == 'success' }}
+    - name: Observe actual Windows host capabilities
+      id: capabilities
+      timeout-minutes: 2
+      run: |
+        set +e
+        {
+          node scripts/windows-capabilities.mjs
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/capabilities.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/capabilities.exit"
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Exercise real native process and private-filesystem controls
+      id: conformance
+      timeout-minutes: 8
+      run: |
+        set +e
+        {
+          node scripts/verify-windows-native.mjs . "$GITHUB_WORKSPACE/.cache/windows-process-boundary/process-boundary.exe"
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/conformance.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/conformance.exit"
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Exercise selected Windows, filesystem and MCP boundaries
+      id: boundaries
+      timeout-minutes: 12
+      run: |
+        set +e
+        {
+          npm run test:focused -- src/windows/WindowsNativeLoader.test.ts src/windows/WindowsOwnedProcess.test.ts tests/boundary/filesystem/binaryTarget.test.ts tests/boundary/filesystem/safeOutputTree.test.ts tests/boundary/providers/native/artifactProvider.archiveSafety.test.ts tests/boundary/filesystem/windowsNpxRegistration.test.ts tests/boundary/filesystem/clientConfigurationEnvironment.test.ts tests/boundary/process/sourceMapUncHosts.test.ts tests/acceptance/applications/runtime.test.ts
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/boundaries.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/boundaries.exit"
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Smoke-test Windows CLI
+      id: cli
+      timeout-minutes: 1
+      run: |
+        set +e
+        {
+          node scripts/rea.mjs --version
+        } 2>&1 | tee "$RUNNER_TEMP/rea-platform-audit/cli.log"
+        result=${PIPESTATUS[0]}
+        printf '%s\n' "$result" > "$RUNNER_TEMP/rea-platform-audit/cli.exit"
+        exit "$result"
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+    - name: Retain actual logs and exit codes
+      if: ${{ always() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rea-platform-windows-${{ github.run_id }}
+        path: ${{ runner.temp }}/rea-platform-audit/
+        if-no-files-found: warn
+        retention-days: 7
+    needs:
+    - windows-native-build
